@@ -1,0 +1,4 @@
+export ALT_DATASET_CAMERA_KEYS="observation.images.camera_1_color_image_raw_compressed,observation.images.camera_2_color_image_raw_compressed"
+export VIZ_PORT=8765
+# LeRobot root with absolute joint targets in ``action`` (not delta actions).
+export ALT_DATASET_PATH=~/workspaces/isaac/lerobot_dataset/cable_pickup_v1_tester_tray_one_end_inserted_trimmed_full_1_0_lerobot/cable_pickup_v1_tester_tray_one_end_inserted_trimmed_full_1_0_lerobot_dataset

@@ -977,6 +977,16 @@ class MixtureSpecElement(BaseModel):
     )
 
 
+def _modality_config_merge_key(configs: object) -> str:
+    """Stable string for deduplicating modality dicts across datasets.
+
+    LeRobot ``meta/modality.json`` can list the same cameras in different key
+    order; ``json.dumps`` without ``sort_keys`` then falsely looks like a
+    mismatch when merging mixture metadata.
+    """
+    return json.dumps(configs, sort_keys=True, separators=(",", ":"))
+
+
 class LeRobotMixtureDataset(Dataset):
     """
     A mixture of multiple datasets. This class samples a single dataset based on the dataset weights and then calls the `__getitem__` method of the sampled dataset.
@@ -1278,7 +1288,7 @@ class LeRobotMixtureDataset(Dataset):
         modality_configs = defaultdict(set)
         for metadata in metadata_dicts:
             for modality, configs in metadata["modalities"].items():
-                modality_configs[modality].add(json.dumps(configs))
+                modality_configs[modality].add(_modality_config_merge_key(configs))
         merged_metadata["modalities"] = {}
         for modality, configs in modality_configs.items():
             # Check that all modality configs correspond to the same tag matches

@@ -12,9 +12,8 @@ Dependencies:
 
 import json
 import logging
-import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import base64
 import numpy as np
@@ -42,7 +41,13 @@ def decode_numpy_from_base64(obj):
 
 class HTTPInferenceServer:
     def __init__(
-        self, policy: Gr00tPolicy, port: int, host: str = "0.0.0.0", api_token: Optional[str] = None
+        self,
+        policy: Gr00tPolicy,
+        port: int,
+        host: str = "0.0.0.0",
+        api_token: Optional[str] = None,
+        response_extras: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        post_act: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
     ):
         """
         A simple HTTP server for GR00T models; exposes `/act` to predict an action for a given observation.
@@ -51,11 +56,22 @@ class HTTPInferenceServer:
 
         If the policy is a ``Gr00tInpaintingPolicy``, a ``POST /reset`` endpoint
         is also registered to clear the action buffer between episodes.
+
+        Args:
+            response_extras: Optional callable ``(observation_after_decode) -> dict`` with
+                JSON-serializable values (float, int, bool, str, lists). Merged into the
+                ``/act`` response after action keys (e.g. ALT ``ood_score``).
+            post_act: If set, called as ``(observation, action_dict) -> dict`` **after**
+                ``get_action``. Return value is merged into the response (same as
+                ``response_extras``). When ``post_act`` is set, ``response_extras`` is
+                ignored (use one path to avoid duplicate ALT work).
         """
         self.policy = policy
         self.port = port
         self.host = host
         self.api_token = api_token
+        self.response_extras = response_extras
+        self.post_act = post_act
         self.app = FastAPI(title="GR00T Inference Server", version="1.0.0")
 
         # Register endpoints
@@ -79,22 +95,30 @@ class HTTPInferenceServer:
 
             obs = payload["observation"]
             
-             # Decode image from base64 if present
-            if "video.camera" in obs:
-                obs["video.camera"] = decode_numpy_from_base64(obs["video.camera"])
+            for key in list(obs.keys()):
+                if key.startswith("video."):
+                    obs[key] = decode_numpy_from_base64(obs[key])
             # print(obs["video.camera"])
 
             # Run inference
-            start_time = time.time()
             action = self.policy.get_action(obs)
-            end_time = time.time()
-            print("time taken to get action: ", end_time - start_time)
-            print(action)
 
             # Return action as JSON with numpy arrays
-            action = {k: v.tolist() for k, v in action.items()}
-            # print(action)
-            return JSONResponse(content=action)
+            out: Dict[str, Any] = {k: v.tolist() for k, v in action.items()}
+            if self.post_act is not None:
+                extra = self.post_act(obs, action)
+                if extra:
+                    out.update(extra)
+            elif self.response_extras is not None:
+                extra = self.response_extras(obs)
+                if extra:
+                    out.update(extra)
+            if "ood_score" in out:
+                msg = f"ood_score={out['ood_score']}"
+                if "is_ood" in out:
+                    msg += f" is_ood={out['is_ood']}"
+                print(msg)
+            return JSONResponse(content=out)
 
         except Exception as e:
             logging.error(traceback.format_exc())
@@ -117,10 +141,16 @@ class HTTPInferenceServer:
             return {"status": "reset", "inpainting": True}
         return {"status": "reset", "inpainting": False}
 
-    def health_check(self) -> Dict[str, str]:
+    def health_check(self) -> Dict[str, Any]:
         """Health check endpoint."""
         is_inpainting = isinstance(self.policy, Gr00tInpaintingPolicy)
-        return {"status": "healthy", "model": "GR00T", "inpainting": is_inpainting}
+        return {
+            "status": "healthy",
+            "model": "GR00T",
+            "inpainting": is_inpainting,
+            "response_extras": self.response_extras is not None,
+            "post_act": self.post_act is not None,
+        }
 
     def run(self) -> None:
         """Start the HTTP server."""
@@ -135,7 +165,12 @@ class HTTPInferenceServer:
 
 
 def create_http_server(
-    policy: Gr00tPolicy, port: int, host: str = "0.0.0.0", api_token: Optional[str] = None
+    policy: Gr00tPolicy,
+    port: int,
+    host: str = "0.0.0.0",
+    api_token: Optional[str] = None,
+    response_extras: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    post_act: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> HTTPInferenceServer:
     """Factory function to create an HTTP inference server."""
-    return HTTPInferenceServer(policy, port, host, api_token)
+    return HTTPInferenceServer(policy, port, host, api_token, response_extras, post_act)

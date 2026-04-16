@@ -1,0 +1,3 @@
+export ISAAC_MANIPULATOR_FINETUNING_ROOT=~/workspaces/isaac/isaac_manipulator_finetuning
+export ALT_CHECKPOINT=~/workspaces/isaac/alt_models/alt_policy_cable_pickup/alt_policy_output/encoder_final.pt
+export ALT_LOOKUP_TABLE=~/workspaces/isaac/alt_models/alt_policy_cable_pickup/alt_policy_output/lookup_table.pkl

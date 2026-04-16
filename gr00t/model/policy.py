@@ -231,23 +231,13 @@ class Gr00tPolicy(BasePolicy):
         self.model.action_head.num_inference_timesteps = value
 
     def _check_state_is_batched(self, obs: Dict[str, Any]) -> bool:
-        # print(obs.keys())
-        for k in obs.keys():
-            print('--------------------------------')
-            
-            if k == 'annotation.human.action.task_description':
-                # print(obs[k])
-                pass
-            else:
-                if k == 'video.camera':
-                    # print(k, np.array(obs[k]).shape)
-                    # print(k, obs[k].shape)
-                    pass
-                elif 'state' in k:
-                    obs[k] = np.array(obs[k]).reshape(1,6)
-                    # print(k, obs[k].shape)
-
-            # print('--------------------------------')
+        for k in list(obs.keys()):
+            if k == "annotation.human.action.task_description":
+                continue
+            if k == "video.camera":
+                continue
+            if "state" in k:
+                obs[k] = np.array(obs[k]).reshape(1, 7)
         for k, v in obs.items():
             if "state" in k and len(v.shape) < 3:  # (B, Time, Dim)
                 return False

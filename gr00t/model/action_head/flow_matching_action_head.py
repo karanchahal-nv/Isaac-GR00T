@@ -323,7 +323,13 @@ class FlowmatchingActionHead(nn.Module):
 
         # Embed noised action trajectory.
         actions = action_input.action  # (B, T, action_dim)
-        B, T, _ = actions.shape
+        B, T, action_d = actions.shape
+        if action_d != self.action_dim:
+            raise ValueError(
+                f"Batch action width {action_d} != model action_dim {self.action_dim} "
+                "(check GR00TTransform max_action_dim matches checkpoint action_head_cfg "
+                "action_dim, not max_action_dim)."
+            )
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
         t = self.sample_time(B, device=actions.device, dtype=actions.dtype)  # (B,)
 
@@ -384,10 +390,12 @@ class FlowmatchingActionHead(nn.Module):
             postfix_mask = (~prefix_mask).unsqueeze(-1).float()  # (B, T, 1)
         else:
             # Standard flow-matching training (no RTC)
-            noisy_trajectory = (1 - t) * noise + t * actions
+            # Explicit (B,1,1) broadcast avoids ambiguous (B,) mixing with (B,T,D).
+            t_mix = t.reshape(B, 1, 1)
+            noisy_trajectory = (1.0 - t_mix) * noise + t_mix * actions
             velocity = actions - noise
-            # Convert (continuous) t -> discrete if needed
-            t_discretized_global = (t[:, 0, 0] * self.num_timestep_buckets).long()
+            # Per-batch scalar timestep -> discrete buckets (t is shape (B,) from sample_time).
+            t_discretized_global = (t.reshape(B) * self.num_timestep_buckets).long()
             action_features = self.action_encoder(noisy_trajectory, t_discretized_global, embodiment_id)
             postfix_mask = None
 
