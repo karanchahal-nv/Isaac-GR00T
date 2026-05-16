@@ -17,6 +17,16 @@ echo "  --num-prefix-steps / --n-action-execute-steps anymore."
 # Override via env: CAPTURE_CHUNKS_PATH=/some/path.npz MAX_CAPTURES=N bash ...
 CAPTURE_CHUNKS_PATH="${CAPTURE_CHUNKS_PATH:-/tmp/chunks_rtc.npz}"
 MAX_CAPTURES="${MAX_CAPTURES:-5}"
+# Inpainting algorithm: 'hybrid' (default) or 'it_rtc' (pure PI IT-RTC).
+INPAINTING_MODE="${INPAINTING_MODE:-hybrid}"
+# Optional: override the client's max_guidance_weight (only meaningful in it_rtc mode).
+# Leave unset to use whatever ROS sends (usually 5.0).
+MAX_GUIDANCE_WEIGHT_OVERRIDE="${MAX_GUIDANCE_WEIGHT_OVERRIDE:-}"
+
+_OPTIONAL_ARGS=()
+if [ -n "$MAX_GUIDANCE_WEIGHT_OVERRIDE" ]; then
+    _OPTIONAL_ARGS+=(--max-guidance-weight-override "$MAX_GUIDANCE_WEIGHT_OVERRIDE")
+fi
 
 python scripts/inference_service.py \
     --server \
@@ -26,5 +36,7 @@ python scripts/inference_service.py \
     --model-path "$GROOT_CHECKPOINT_PATH" \
     --num-action-steps "$NUM_ACTION_STEPS" \
     --use-inpainting \
+    --inpainting-mode "$INPAINTING_MODE" \
     --capture-chunks-path "$CAPTURE_CHUNKS_PATH" \
-    --max-captures "$MAX_CAPTURES"
+    --max-captures "$MAX_CAPTURES" \
+    "${_OPTIONAL_ARGS[@]}"

@@ -813,6 +813,196 @@ class FlowmatchingActionHead(nn.Module):
 
         return BatchFeature(data={"action_pred": actions})
 
+    @staticmethod
+    def build_prefix_weights_it_rtc(
+        d: int,
+        K: int,
+        H: int,
+        schedule: str,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """PI-style guidance weights, ported verbatim from PI's
+        ``get_prefix_weights`` (pi-rtc-kinetix/src/model.py:40-63).
+
+        Args ``d`` and ``K`` correspond to PI's ``start`` and ``end``.
+
+        With d=2, end=6, total=10, the output is:
+            [1, 1, 4/5, 3/5, 2/5, 1/5, 0, 0, 0, 0]
+                 ^                ^
+               start             end
+        (then optionally passed through the exp transform w * (e^w-1)/(e-1)).
+        """
+        # PI: start = min(start, end)
+        start = min(d, K)
+
+        if schedule == "ones":
+            w = torch.ones(H, device=device, dtype=dtype)
+        elif schedule == "zeros":
+            w = (torch.arange(H, device=device) < start).to(dtype)
+        elif schedule in ("linear", "exp"):
+            arange = torch.arange(H, device=device, dtype=dtype)
+            # PI: w = clip((start - 1 - arange) / (end - start + 1) + 1, 0, 1)
+            w = torch.clamp((start - 1 - arange) / (K - start + 1) + 1, 0.0, 1.0)
+            if schedule == "exp":
+                # PI: w = w * expm1(w) / (e - 1)
+                e_minus_1 = float(torch.e) - 1.0
+                w = w * torch.expm1(w) / e_minus_1
+        else:
+            raise ValueError(f"unknown prefix_attention_schedule: {schedule!r}")
+
+        # PI: zero past `end`
+        w = torch.where(torch.arange(H, device=device) >= K, torch.zeros_like(w), w)
+        return w
+
+    def get_action_pure_it_rtc(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        prior_chunk_slice: torch.Tensor,
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 5.0,
+    ) -> BatchFeature:
+        """Pure PI IT-RTC: gradient-guided denoising, no prefix overwriting.
+
+        Mirrors ``pi-rtc-kinetix/src/model.py`` ``realtime_action`` when
+        ``simulated_delay is None`` — the published IT-RTC algorithm.
+
+        Differences vs ``get_action_with_guidance`` (the hybrid):
+        * No prefix overwriting at any point (init from pure noise, stay free).
+        * Uniform discrete timestep across all positions (no t=1.0 per-position).
+        * Weights cover [0, K) with PI's schedule (W[0:d]=1.0).
+        * The model is fed in-distribution inputs throughout, so the autograd
+          VJP through the DiT gives meaningful gradients.
+
+        Trade-off: positions [0, d) are no longer bit-exact equal to
+        prior_chunk_slice — they are *strongly pulled* via weight=1.0 but
+        the constraint is finite. For the safety property in async RTC, this
+        is acceptable because the ROS client slices off the first d_actual
+        positions before queueing, so the robot never executes them anyway.
+
+        Args:
+            prior_chunk_slice: (B, L, action_dim) with L >= prefix_attention_horizon.
+                Already sliced by the policy to start at c+1 of the cached
+                prior chunk. Only the first ``prefix_attention_horizon``
+                positions are used (the rest are ignored).
+        """
+        backbone_output = self.process_backbone_output(backbone_output)
+        vl_embs = backbone_output.backbone_features
+        embodiment_id = action_input.embodiment_id
+
+        state_features = self.state_encoder(action_input.state, embodiment_id)
+
+        batch_size = vl_embs.shape[0]
+        device = vl_embs.device
+        T = self.config.action_horizon
+        action_dim = self.config.action_dim
+        d = inference_delay
+        K = prefix_attention_horizon
+
+        if K > T:
+            raise RuntimeError(
+                f"pure IT-RTC: prefix_attention_horizon={K} exceeds T={T}"
+            )
+        if prior_chunk_slice.shape[1] < K:
+            raise RuntimeError(
+                f"pure IT-RTC: prior_chunk_slice has {prior_chunk_slice.shape[1]} "
+                f"positions but K={K}"
+            )
+
+        prior_chunk_slice = prior_chunk_slice.to(dtype=vl_embs.dtype, device=device)
+
+        # Target y of shape (B, T, action_dim). y[k] = prior[k] for k in [0, K).
+        # Past K the weight is zero so y[K:] is don't-care; we set it to 0.
+        y = torch.zeros(batch_size, T, action_dim, dtype=vl_embs.dtype, device=device)
+        y[:, :K, :] = prior_chunk_slice[:, :K, :]
+
+        # PI's weights: 1.0 in [0, d), decay in [d, K), 0 in [K, T).
+        W = self.build_prefix_weights_it_rtc(
+            d=d, K=K, H=T,
+            schedule=prefix_attention_schedule,
+            device=device, dtype=vl_embs.dtype,
+        )
+
+        # Seed from pure noise. No prefix overwriting at any point in this method.
+        actions = torch.randn(
+            size=(batch_size, T, action_dim),
+            dtype=vl_embs.dtype,
+            device=device,
+        )
+
+        num_steps = self.num_inference_timesteps
+        dt = 1.0 / num_steps
+
+        # Precompute frozen tensors used inside the autograd region.
+        with torch.no_grad():
+            future_tokens_const = self.future_tokens.weight.unsqueeze(0).expand(
+                batch_size, -1, -1
+            )
+            if self.config.add_pos_embed:
+                pos_ids = torch.arange(T, dtype=torch.long, device=device)
+                pos_embs_const = self.position_embedding(pos_ids).unsqueeze(0)
+            else:
+                pos_embs_const = None
+
+        for step in range(num_steps):
+            t_cont = step / float(num_steps)
+            t_disc = int(t_cont * self.num_timestep_buckets)
+
+            # Uniform timestep across all positions — no per-position trick.
+            timesteps_tensor = torch.full(
+                (batch_size,), fill_value=t_disc, dtype=torch.long, device=device
+            )
+
+            with torch.enable_grad():
+                actions_grad = actions.detach().requires_grad_(True)
+
+                action_features = self.action_encoder(
+                    actions_grad, timesteps_tensor, embodiment_id
+                )
+                if pos_embs_const is not None:
+                    action_features = action_features + pos_embs_const
+
+                sa_embs = torch.cat(
+                    (state_features, future_tokens_const, action_features), dim=1
+                )
+                global_timestep = torch.full(
+                    (batch_size,), fill_value=t_disc, device=device
+                )
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    timestep=global_timestep,
+                )
+                pred = self.action_decoder(model_output, embodiment_id)
+                v_t = pred[:, -T:]
+
+                # Predicted clean: x_1 = x_t + (1 - t) * v_t.
+                x_1 = actions_grad + (1.0 - t_cont) * v_t
+                err = (y - x_1).detach() * W.view(1, T, 1)
+                L = (err * x_1).sum()
+                correction = torch.autograd.grad(L, actions_grad)[0]
+
+            v_t_d = v_t.detach()
+
+            # Guidance weight λ(t) — PI's formula, capped at max_guidance_weight.
+            if t_cont > 1e-6:
+                c_t = (1.0 - t_cont) / t_cont
+            else:
+                c_t = float(max_guidance_weight)
+            denom = max((1.0 - t_cont) ** 2, 1e-8)
+            inv_r2 = (t_cont ** 2 + (1.0 - t_cont) ** 2) / denom
+            lam = min(c_t * inv_r2, float(max_guidance_weight))
+
+            v_corrected = v_t_d + lam * correction
+
+            actions = actions.detach() + dt * v_corrected
+
+        # NO overwriting — purely guided. [0, d) is strongly pulled but not exact.
+        return BatchFeature(data={"action_pred": actions})
+
     @property
     def device(self):
         return next(iter(self.parameters())).device

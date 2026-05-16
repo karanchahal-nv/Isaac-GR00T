@@ -154,6 +154,15 @@ class ArgsConfig:
     HTTP body (``current_action_sequence_index``, ``estimated_delay_ticks``).
     The first request omits ``rtc`` and falls through to vanilla denoise."""
 
+    inpainting_mode: Literal["hybrid", "it_rtc"] = "hybrid"
+    """Phase-2 inpainting algorithm. 'hybrid' (default) does hard-clamp [0,d) +
+    soft-guidance [d,K). 'it_rtc' is pure PI IT-RTC (no overwriting, in-distribution
+    inputs, constraint enforced entirely via gradient guidance with W[0:d]=1.0)."""
+
+    max_guidance_weight_override: Optional[float] = None
+    """If set, overrides the max_guidance_weight value sent by the ROS client.
+    Used for sweeping guidance strength without changing the ROS payload."""
+
     capture_chunks_path: Optional[str] = None
     """If set, save the first ``max_captures`` predicted action chunks to this
     .npz path. Used for offline RTC-vs-no-RTC comparison plots."""
@@ -662,7 +671,7 @@ def main(args: ArgsConfig):
         )
 
         if args.use_inpainting:
-            print("Using INPAINTING policy: client-driven RTC (stateful chunk cache)")
+            print(f"Using INPAINTING policy: client-driven RTC (mode={args.inpainting_mode})")
             policy = Gr00tInpaintingPolicy(
                 model_path=args.model_path,
                 modality_config=modality_config,
@@ -671,6 +680,8 @@ def main(args: ArgsConfig):
                 denoising_steps=args.denoising_steps,
                 capture_chunks_path=args.capture_chunks_path,
                 max_captures=args.max_captures,
+                inpainting_mode=args.inpainting_mode,
+                max_guidance_weight_override=args.max_guidance_weight_override,
             )
         else:
             policy = Gr00tPolicy(

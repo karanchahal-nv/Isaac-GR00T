@@ -477,8 +477,38 @@ class Gr00tInpaintingPolicy(Gr00tPolicy):
     violation between client and server.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        inpainting_mode: str = "hybrid",
+        max_guidance_weight_override: Optional[float] = None,
+        **kwargs,
+    ):
+        """
+        inpainting_mode:
+            "hybrid"  -> hard-clamp [0, d) + soft guidance [d, K) via guidance head.
+                         What we've been running. Has OOD issues when the model
+                         wasn't trained with max_rtc_delay > 0 because the per-
+                         position time = 1.0 trick is out-of-distribution.
+            "it_rtc"  -> Pure PI IT-RTC. No overwriting, no per-position time.
+                         Constraint enforced entirely via gradient guidance with
+                         W[0:d]=1.0 + decay schedule. Stays in-distribution. No
+                         bit-exact match guarantee in [0, d) but strongly pulled.
+        """
+        if inpainting_mode not in ("hybrid", "it_rtc"):
+            raise ValueError(
+                f"inpainting_mode must be 'hybrid' or 'it_rtc', got {inpainting_mode!r}"
+            )
         super().__init__(*args, **kwargs)
+        self._inpainting_mode = inpainting_mode
+        # If set, override what the client sends in rtc.max_guidance_weight.
+        # Use this to sweep guidance strength without changing the ROS payload.
+        self._max_guidance_weight_override: Optional[float] = max_guidance_weight_override
+        if max_guidance_weight_override is not None:
+            print(
+                f"Gr00tInpaintingPolicy: max_guidance_weight_override="
+                f"{max_guidance_weight_override} (will override client-sent value)"
+            )
         # Cache of the last normalized chunk returned, shape (1, H, action_dim).
         self._prev_chunk_normalized: Optional[torch.Tensor] = None
         # Staged RTC info from the most recent HTTP request. Consumed once per
@@ -492,6 +522,7 @@ class Gr00tInpaintingPolicy(Gr00tPolicy):
         # so capture-side code can pair it with the chunk that the request
         # produces, even though the staged fields are cleared during inference.
         self._last_rtc_metadata: Optional[Dict[str, Any]] = None
+        print(f"Gr00tInpaintingPolicy: inpainting_mode={self._inpainting_mode}")
 
     def stage_external_rtc(
         self,
@@ -558,6 +589,12 @@ class Gr00tInpaintingPolicy(Gr00tPolicy):
         self._staged_schedule = None
         self._staged_max_guidance_weight = None
 
+        # Server-side override of max_guidance_weight, if set at construction.
+        # Takes precedence over the value sent by the client. Used for sweeping
+        # guidance strength without touching the ROS payload.
+        if self._max_guidance_weight_override is not None:
+            max_w = self._max_guidance_weight_override
+
         if c is not None and d is not None and self._prev_chunk_normalized is not None:
             H = self._prev_chunk_normalized.shape[1]
             # The slice we expose to the model spans [c+1, c+1+max(d, K)).
@@ -578,26 +615,46 @@ class Gr00tInpaintingPolicy(Gr00tPolicy):
                 num_prefix = d
                 K = K_staged
 
-        # Decide path: Phase 2 guidance if K > d (soft region exists),
-        # otherwise Phase 1 hard-only.
-        use_guidance = (
-            K is not None
+        # Decide path. Three possibilities:
+        #   - 'it_rtc' mode: use pure PI IT-RTC if we have a prefix slice + K > 0
+        #   - 'hybrid' mode with K > d: use hybrid hard+soft guidance
+        #   - otherwise: Phase 1 hard-only (or vanilla if no prefix)
+        soft_region_present = (
+            K is not None and num_prefix > 0 and K > num_prefix and prefix_actions is not None
+        )
+        use_pure_it_rtc = (
+            self._inpainting_mode == "it_rtc"
             and num_prefix > 0
-            and K > num_prefix
+            and K is not None
+            and K > 0
             and prefix_actions is not None
         )
+        use_hybrid_guidance = (
+            self._inpainting_mode == "hybrid" and soft_region_present
+        )
 
-        if use_guidance:
-            # Need autograd for pinv-correction, so use no_grad (not
-            # inference_mode) so we can selectively enable grad inside.
+        if use_pure_it_rtc:
             with torch.no_grad(), torch.autocast(
                 device_type="cuda", dtype=COMPUTE_DTYPE
             ):
-                # We need to mirror what self.model.get_action does in the
-                # observation-encoding portion, then dispatch the action head's
-                # guidance variant. The vanilla get_action() goes:
-                #   backbone(...) -> backbone_output ; action_head.get_action(...)
-                # We replicate that here with the guidance head.
+                backbone_inputs, action_inputs = self.model.prepare_input(
+                    normalized_input
+                )
+                backbone_outputs = self.model.backbone(backbone_inputs)
+                model_pred = self.model.action_head.get_action_pure_it_rtc(
+                    backbone_outputs,
+                    action_inputs,
+                    prior_chunk_slice=prefix_actions,
+                    inference_delay=num_prefix,
+                    prefix_attention_horizon=K,
+                    prefix_attention_schedule=schedule or "exp",
+                    max_guidance_weight=max_w if max_w is not None else 5.0,
+                )
+                self.model.validate_data(model_pred, backbone_outputs, is_training=False)
+        elif use_hybrid_guidance:
+            with torch.no_grad(), torch.autocast(
+                device_type="cuda", dtype=COMPUTE_DTYPE
+            ):
                 backbone_inputs, action_inputs = self.model.prepare_input(
                     normalized_input
                 )
@@ -611,14 +668,12 @@ class Gr00tInpaintingPolicy(Gr00tPolicy):
                     prefix_attention_schedule=schedule or "exp",
                     max_guidance_weight=max_w if max_w is not None else 5.0,
                 )
-                # Validate same as the vanilla path does (shape only).
                 self.model.validate_data(model_pred, backbone_outputs, is_training=False)
         else:
-            # Phase 1 hard-clamp-only path.
+            # Phase 1 hard-clamp-only path (or vanilla if no prefix).
             with torch.inference_mode(), torch.autocast(
                 device_type="cuda", dtype=COMPUTE_DTYPE
             ):
-                # For hard-only, only pass the first `num_prefix` positions.
                 hard_only_prefix = (
                     prefix_actions[:, :num_prefix, :] if prefix_actions is not None else None
                 )

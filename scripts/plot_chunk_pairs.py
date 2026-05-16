@@ -69,6 +69,12 @@ def main() -> int:
     if d_actual_per_call is not None:
         print(f"  RTC metadata present: rtc.last_actual_delay_ticks = {d_actual_per_call.tolist()}")
 
+    # Metadata-driven offsets, when available. These are authoritative because
+    # detect_offset (exact-prefix scan) fails on IT-RTC where the hard region
+    # is only approximately equal to prior, not bit-exact.
+    meta_c = data["rtc.current_index"] if "rtc.current_index" in data.files else None
+    meta_d = data["rtc.estimated_delay"] if "rtc.estimated_delay" in data.files else None
+
     n_pairs = N - 1
     joint_names = (
         [s.strip() for s in args.joint_names.split(",")] if args.joint_names else
@@ -85,7 +91,14 @@ def main() -> int:
     for pair_idx in range(n_pairs):
         prev_chunk = chunks[pair_idx]
         curr_chunk = chunks[pair_idx + 1]
-        c, d = detect_offset(prev_chunk, curr_chunk)
+        # Prefer authoritative metadata over the exact-match scan when present.
+        # Metadata is indexed by the chunk produced by that request; pair_idx+1
+        # is the new chunk's index.
+        if meta_c is not None and meta_d is not None and pair_idx + 1 < len(meta_c) and meta_c[pair_idx + 1] >= 0:
+            c = int(meta_c[pair_idx + 1])
+            d = int(meta_d[pair_idx + 1])
+        else:
+            c, d = detect_offset(prev_chunk, curr_chunk)
         offset = c + 1 if c >= 0 else 0   # x-offset for curr_chunk
 
         for j in range(D):
