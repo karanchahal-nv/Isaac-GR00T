@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 
 import torch
@@ -348,9 +349,21 @@ class FlowmatchingActionHead(nn.Module):
         # the behaviour is identical to standard flow-matching training.
         use_rtc = getattr(self.config, "max_rtc_delay", 0) > 0
         if use_rtc:
-            max_delay = self.config.max_rtc_delay
-            # Sample a random delay per batch element: d in [0, max_delay]
-            delay = torch.randint(0, max_delay + 1, (B,), device=device)  # (B,)
+            # Cap at T-1 so every sample has at least one postfix position
+            # (otherwise the loss is zero for that sample and no gradient flows).
+            max_d = min(self.config.max_rtc_delay, T - 1)
+            support_size = max_d + 1  # delay values 0, 1, ..., max_d
+
+            # Exponentially-weighted sampling biased toward small delays, matching
+            # Physical Intelligence's TT-RTC: w[k] ∝ exp(max_d - k), so delay=0
+            # gets the highest probability. The intuition is that real-world
+            # inference latency is usually short, so the model should see "no/short
+            # prefix" far more often than "long prefix" during training.
+            w = torch.exp(
+                torch.arange(support_size, device=device, dtype=torch.float32).flip(0)
+            )
+            w = w / w.sum()
+            delay = torch.multinomial(w, B, replacement=True)  # (B,) in [0, support_size)
 
             # Build per-position continuous timesteps: (B, T)
             pos_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)  # (B, T)
@@ -501,6 +514,38 @@ class FlowmatchingActionHead(nn.Module):
             and num_prefix_steps <= T
         )
         if use_inpainting:
+            # Shape validation: prefix_actions must cover the requested prefix length.
+            expected = (batch_size, num_prefix_steps, self.config.action_dim)
+            if (
+                prefix_actions.shape[0] != batch_size
+                or prefix_actions.shape[1] < num_prefix_steps
+                or prefix_actions.shape[2] != self.config.action_dim
+            ):
+                raise ValueError(
+                    f"prefix_actions shape {tuple(prefix_actions.shape)} incompatible with "
+                    f"(batch={batch_size}, >={num_prefix_steps}, action_dim={self.config.action_dim}); "
+                    f"expected at least {expected}."
+                )
+
+            # Warn if the model was not trained with TT-RTC: inpainting will be OOD.
+            trained_max_delay = getattr(self.config, "max_rtc_delay", 0)
+            if trained_max_delay == 0:
+                warnings.warn(
+                    "prefix_actions provided but the model was trained with "
+                    "max_rtc_delay=0 (no TT-RTC). Inpainting will be out-of-distribution "
+                    "and results may degrade.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif num_prefix_steps > trained_max_delay:
+                warnings.warn(
+                    f"num_prefix_steps={num_prefix_steps} exceeds the training-time "
+                    f"max_rtc_delay={trained_max_delay}; the model has never seen this "
+                    f"many clamped prefix tokens and results may degrade.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
             prefix_actions = prefix_actions.to(dtype=actions.dtype, device=device)
             actions[:, :num_prefix_steps, :] = prefix_actions[:, :num_prefix_steps, :]
 
@@ -520,9 +565,8 @@ class FlowmatchingActionHead(nn.Module):
                 )
                 t_per_pos[:, :num_prefix_steps] = self.num_timestep_buckets
 
-                # Clamp prefix to clean actions before encoding
-                actions[:, :num_prefix_steps, :] = prefix_actions[:, :num_prefix_steps, :]
-
+                # Prefix is already clean here: it was seeded at line ~518 before the loop,
+                # and re-clamped after every Euler step (line ~577 below). No clamp needed.
                 action_features = self.action_encoder(actions, t_per_pos, embodiment_id)
             else:
                 # Standard: single timestep for all positions
@@ -562,6 +606,210 @@ class FlowmatchingActionHead(nn.Module):
             # Clamp prefix positions back after the Euler step.
             if use_inpainting:
                 actions[:, :num_prefix_steps, :] = prefix_actions[:, :num_prefix_steps, :]
+
+        return BatchFeature(data={"action_pred": actions})
+
+    @staticmethod
+    def build_prefix_weights(
+        d: int,
+        K: int,
+        H: int,
+        schedule: str,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Per-position guidance weights for the soft-mask region [d, K).
+
+        Hard region [0, d) and free region [K, H) both get weight=0; the hard
+        region is handled separately by overwriting, so guidance there is
+        redundant. The soft region's weight decays from 1 at k=d toward 0 at
+        k=K-1 according to ``schedule``.
+
+        Returns a tensor of shape (H,).
+        """
+        w = torch.zeros(H, device=device, dtype=dtype)
+        if K <= d:
+            return w
+        soft_len = K - d
+        if soft_len == 1:
+            w[d] = 1.0
+            return w
+        # norm goes 0 at k=d, 1 at k=K-1.
+        norm = torch.linspace(0.0, 1.0, soft_len, device=device, dtype=dtype)
+        if schedule == "exp":
+            w[d:K] = torch.exp(-3.0 * norm)
+        elif schedule == "linear":
+            w[d:K] = 1.0 - norm
+        elif schedule == "ones":
+            w[d:K] = 1.0
+        elif schedule == "zeros":
+            w[d:K] = 0.0
+        else:
+            raise ValueError(f"unknown prefix_attention_schedule: {schedule!r}")
+        return w
+
+    def get_action_with_guidance(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        prefix_actions: torch.Tensor,
+        num_prefix_steps: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 5.0,
+    ) -> BatchFeature:
+        """Denoise with hard-clamp prefix + pinv-corrected soft guidance.
+
+        Hard region (positions [0, num_prefix_steps)): overwritten to match
+        ``prefix_actions`` exactly after every Euler step, same as the
+        Phase-1 path. Per-position timestep is set to ``num_timestep_buckets``
+        so the action encoder sees "clean" for these positions.
+
+        Soft region (positions [num_prefix_steps, prefix_attention_horizon)):
+        the velocity field is nudged via PI's pinv-corrected guidance toward
+        the same ``prefix_actions`` tensor (the model's prediction is pulled
+        toward y but not forced). Weights decay according to
+        ``prefix_attention_schedule``.
+
+        Free region (positions [prefix_attention_horizon, H)): pure model.
+
+        Reference: PI's ``realtime_action`` in pi-rtc-kinetix/src/model.py,
+        adapted to PyTorch + GR00T's DiT.
+        """
+        backbone_output = self.process_backbone_output(backbone_output)
+        vl_embs = backbone_output.backbone_features
+        embodiment_id = action_input.embodiment_id
+
+        state_features = self.state_encoder(action_input.state, embodiment_id)
+
+        batch_size = vl_embs.shape[0]
+        device = vl_embs.device
+        T = self.config.action_horizon
+        action_dim = self.config.action_dim
+
+        # Validate inputs (server-side contract).
+        if prefix_actions.shape[1] < prefix_attention_horizon:
+            raise RuntimeError(
+                f"guidance: prefix_actions has {prefix_actions.shape[1]} positions "
+                f"but prefix_attention_horizon={prefix_attention_horizon}; need >="
+            )
+        if prefix_attention_horizon > T:
+            raise RuntimeError(
+                f"guidance: prefix_attention_horizon={prefix_attention_horizon} "
+                f"exceeds chunk horizon T={T}"
+            )
+
+        prefix_actions = prefix_actions.to(dtype=vl_embs.dtype, device=device)
+
+        # Build the per-position target y. We align the new chunk to the
+        # prior chunk's tail: y[k] corresponds to prefix_actions[k]. Only the
+        # first prefix_attention_horizon positions matter (the rest have
+        # weight=0 anyway), but we zero-pad to length T for shape consistency.
+        y = torch.zeros(batch_size, T, action_dim, dtype=vl_embs.dtype, device=device)
+        K = min(prefix_attention_horizon, prefix_actions.shape[1])
+        y[:, :K, :] = prefix_actions[:, :K, :]
+
+        # Per-position guidance weights. Hard region [0, d) gets weight 0
+        # because the hard-clamp overwrite handles that exactly already.
+        W = self.build_prefix_weights(
+            d=num_prefix_steps,
+            K=prefix_attention_horizon,
+            H=T,
+            schedule=prefix_attention_schedule,
+            device=device,
+            dtype=vl_embs.dtype,
+        )  # (T,)
+
+        # Seed actions from noise; hard region overwritten immediately so the
+        # first Euler step sees clean prefix tokens.
+        actions = torch.randn(
+            size=(batch_size, T, action_dim),
+            dtype=vl_embs.dtype,
+            device=device,
+        )
+        actions[:, :num_prefix_steps, :] = prefix_actions[:, :num_prefix_steps, :]
+
+        num_steps = self.num_inference_timesteps
+        dt = 1.0 / num_steps
+
+        # We need autograd through the model for the pinv-correction. Make
+        # sure model params don't accumulate grads (they shouldn't anyway,
+        # since we're in inference, but be defensive).
+        with torch.no_grad():
+            future_tokens_const = self.future_tokens.weight.unsqueeze(0).expand(
+                batch_size, -1, -1
+            )
+            if self.config.add_pos_embed:
+                pos_ids = torch.arange(T, dtype=torch.long, device=device)
+                pos_embs_const = self.position_embedding(pos_ids).unsqueeze(0)
+            else:
+                pos_embs_const = None
+
+        for step in range(num_steps):
+            t_cont = step / float(num_steps)
+            t_disc = int(t_cont * self.num_timestep_buckets)
+
+            # Per-position discrete time: clean (=num_timestep_buckets) for
+            # the hard region, current step otherwise.
+            t_per_pos = torch.full(
+                (batch_size, T), fill_value=t_disc, dtype=torch.long, device=device
+            )
+            t_per_pos[:, :num_prefix_steps] = self.num_timestep_buckets
+
+            # ----- Forward with autograd to compute pinv correction -----
+            with torch.enable_grad():
+                actions_grad = actions.detach().requires_grad_(True)
+
+                action_features = self.action_encoder(
+                    actions_grad, t_per_pos, embodiment_id
+                )
+                if pos_embs_const is not None:
+                    action_features = action_features + pos_embs_const
+
+                sa_embs = torch.cat(
+                    (state_features, future_tokens_const, action_features), dim=1
+                )
+                global_timestep = torch.full(
+                    size=(batch_size,), fill_value=t_disc, device=device
+                )
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    timestep=global_timestep,
+                )
+                pred = self.action_decoder(model_output, embodiment_id)
+                v_t = pred[:, -T:]
+
+                # Predicted clean: x_1 = x_t + (1 - t) * v_t
+                x_1 = actions_grad + (1.0 - t_cont) * v_t
+                # Cotangent: (y - x_1) weighted per-position.
+                err = (y - x_1).detach() * W.view(1, T, 1)
+                # VJP through (x_t -> x_1): L = <err, x_1>, ∂L/∂x_t = correction.
+                # Stop gradient on err so it's just a cotangent.
+                L = (err * x_1).sum()
+                correction = torch.autograd.grad(L, actions_grad)[0]
+
+            # Detach for the Euler step.
+            v_t_d = v_t.detach()
+
+            # Guidance weight λ(t) — PI's formula, capped at max_guidance_weight.
+            if t_cont > 1e-6:
+                c_t = (1.0 - t_cont) / t_cont
+            else:
+                c_t = float(max_guidance_weight)
+            denom = max((1.0 - t_cont) ** 2, 1e-8)
+            inv_r2 = (t_cont ** 2 + (1.0 - t_cont) ** 2) / denom
+            lam = min(c_t * inv_r2, float(max_guidance_weight))
+
+            v_corrected = v_t_d + lam * correction
+
+            # Euler step.
+            actions = actions.detach() + dt * v_corrected
+
+            # Hard re-clamp: prefix positions must remain exactly prefix_actions
+            # regardless of what the Euler step did (guidance has weight 0 there
+            # so correction is already ~0, but defensive overwrite is cheap).
+            actions[:, :num_prefix_steps, :] = prefix_actions[:, :num_prefix_steps, :]
 
         return BatchFeature(data={"action_pred": actions})
 

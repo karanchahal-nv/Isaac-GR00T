@@ -70,6 +70,8 @@ class Gr00tPolicy(BasePolicy):
         modality_transform: ComposedModalityTransform,
         denoising_steps: Optional[int] = None,
         device: Union[int, str] = "cuda" if torch.cuda.is_available() else "cpu",
+        capture_chunks_path: Optional[str] = None,
+        max_captures: int = 2,
     ):
         """
         Initialize the Gr00tPolicy.
@@ -81,6 +83,10 @@ class Gr00tPolicy(BasePolicy):
             embodiment_tag (Union[str, EmbodimentTag]): The embodiment tag for the model.
             denoising_steps: Number of denoising steps to use for the action head.
             device (Union[int, str]): Device to run the model on.
+            capture_chunks_path: If set, capture the first ``max_captures`` predicted
+                action chunks and write them to this .npz path. Used for offline
+                comparison between RTC and non-RTC inference.
+            max_captures: Number of action chunks to capture before writing the .npz.
         """
         try:
             # NOTE(YL) this returns the local path to the model which is normally
@@ -117,6 +123,98 @@ class Gr00tPolicy(BasePolicy):
             ):
                 self.model.action_head.num_inference_timesteps = denoising_steps
                 print(f"Set action denoising steps to {denoising_steps}")
+
+        # Action-chunk capture for offline analysis (e.g. RTC vs no-RTC comparison).
+        self._capture_chunks_path = capture_chunks_path
+        self._max_captures = max_captures
+        self._captured_chunks: list = []
+        self._capture_written = False
+        if capture_chunks_path:
+            print(
+                f"Action-chunk capture enabled: will save first {max_captures} "
+                f"chunks to {capture_chunks_path}"
+            )
+
+    def _maybe_capture_chunk(self, unnormalized_action: Dict[str, Any]) -> None:
+        """Record a predicted action chunk; flush to .npz when max_captures reached."""
+        if not self._capture_chunks_path or self._capture_written:
+            return
+        # Snapshot every action.* key so callers can pick whatever joint key they
+        # actually want at plot time.
+        snapshot = {
+            k: (v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v))
+            for k, v in unnormalized_action.items()
+            if k.startswith("action") or k.startswith("action.")
+        }
+        self._captured_chunks.append(snapshot)
+
+        # Per-call RTC metadata, if the policy recorded it during staging.
+        # Subclasses (Gr00tInpaintingPolicy) set self._last_rtc_metadata in
+        # stage_external_rtc; first request and non-inpainting calls have None.
+        rtc_meta = getattr(self, "_last_rtc_metadata", None)
+        if not hasattr(self, "_captured_rtc_metadata"):
+            self._captured_rtc_metadata: list = []
+        self._captured_rtc_metadata.append(rtc_meta)
+        # Clear so the next call starts blank (avoids accidentally re-using
+        # this snapshot for a request that arrived without rtc).
+        if hasattr(self, "_last_rtc_metadata"):
+            self._last_rtc_metadata = None
+
+        print(
+            f"[capture] saved chunk {len(self._captured_chunks)}/{self._max_captures}"
+        )
+        if len(self._captured_chunks) >= self._max_captures:
+            self._flush_captured_chunks()
+
+    def _flush_captured_chunks(self) -> None:
+        """Write captured chunks to disk as a single .npz file."""
+        if not self._captured_chunks or self._capture_written:
+            return
+        out: Dict[str, np.ndarray] = {}
+        keys = self._captured_chunks[0].keys()
+        for k in keys:
+            # Stack per-call snapshots along a new leading axis.
+            try:
+                out[k] = np.stack(
+                    [c[k] for c in self._captured_chunks], axis=0
+                )
+            except ValueError as e:
+                print(f"[capture] could not stack key '{k}': {e}; skipping")
+
+        # Per-call RTC metadata as parallel arrays of length N. Use -1
+        # sentinels for calls that had no rtc block (first request,
+        # non-inpainting policies).
+        meta_list = getattr(self, "_captured_rtc_metadata", None)
+        if meta_list:
+            n = len(self._captured_chunks)
+            int_fields = ["current_index", "estimated_delay",
+                          "prefix_attention_horizon", "last_actual_delay_ticks"]
+            float_fields = ["max_guidance_weight"]
+            str_fields = ["prefix_attention_schedule"]
+            for f in int_fields:
+                out[f"rtc.{f}"] = np.array(
+                    [m[f] if m is not None else -1 for m in meta_list],
+                    dtype=np.int64,
+                )
+            for f in float_fields:
+                out[f"rtc.{f}"] = np.array(
+                    [m[f] if m is not None else -1.0 for m in meta_list],
+                    dtype=np.float32,
+                )
+            for f in str_fields:
+                # np.array of bytes for stringy fields; readable from numpy
+                out[f"rtc.{f}"] = np.array(
+                    [m[f] if m is not None else "" for m in meta_list],
+                )
+
+        Path(self._capture_chunks_path).parent.mkdir(parents=True, exist_ok=True)
+        np.savez(self._capture_chunks_path, **out)
+        self._capture_written = True
+        print(
+            f"[capture] wrote {len(self._captured_chunks)} chunks "
+            f"to {self._capture_chunks_path} "
+            f"(keys: {list(out.keys())})"
+        )
 
     def apply_transforms(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -183,6 +281,10 @@ class Gr00tPolicy(BasePolicy):
 
         if not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
+
+        # Optional offline capture for RTC-vs-no-RTC comparison plots.
+        self._maybe_capture_chunk(unnormalized_action)
+
         return unnormalized_action
 
     def _get_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
@@ -231,13 +333,25 @@ class Gr00tPolicy(BasePolicy):
         self.model.action_head.num_inference_timesteps = value
 
     def _check_state_is_batched(self, obs: Dict[str, Any]) -> bool:
+        has_batched_video = any(
+            "video" in k and np.array(v).ndim == 5
+            for k, v in obs.items()
+        )
         for k in list(obs.keys()):
             if k == "annotation.human.action.task_description":
                 continue
             if k == "video.camera":
                 continue
             if "state" in k:
-                obs[k] = np.array(obs[k]).reshape(1, 7)
+                state = np.array(obs[k])
+                if has_batched_video and state.ndim == 1:
+                    obs[k] = state.reshape(1, 1, state.shape[0])
+                elif has_batched_video and state.ndim == 2:
+                    obs[k] = state.reshape(1, state.shape[0], state.shape[1])
+                elif state.ndim == 1:
+                    obs[k] = state.reshape(1, state.shape[0])
+                else:
+                    obs[k] = state
         for k, v in obs.items():
             if "state" in k and len(v.shape) < 3:  # (B, Time, Dim)
                 return False
@@ -336,75 +450,188 @@ class Gr00tPolicy(BasePolicy):
 
 class Gr00tInpaintingPolicy(Gr00tPolicy):
     """
-    Policy with real-time action chunking via flow-matching inpainting.
+    Stateful policy for client-driven Real-Time Chunking (RTC).
 
-    At each inference call, the first ``num_prefix_steps`` actions are clamped
-    to the tail of the *previous* prediction (shifted by ``n_action_steps``),
-    and only the remaining suffix is freely denoised.  This provides temporal
-    consistency between consecutive action chunks.
+    Protocol (Phase 1, hard-clamp only):
+      - The server caches the most recent *normalized* chunk it returned
+        (``_prev_chunk_normalized``).
+      - Before each ``get_action`` call, the HTTP layer calls
+        ``stage_external_rtc(current_index, estimated_delay, prefix_attention_horizon)``
+        with the values from the request body's ``rtc`` block.
+      - ``current_index`` is the zero-based index of the last action from the
+        cached prior chunk that the client already dispatched to the robot.
+      - ``estimated_delay`` is the number of actions the client expects to
+        dispatch *during* this inference round-trip — these are the positions
+        that must be hard-clamped because the robot is already committed to them.
+      - Time alignment: ``new_chunk[k]`` is time-aligned with
+        ``prior_chunk[current_index + 1 + k]``. So we hard-clamp
+        ``new_chunk[0 : estimated_delay] = prior_chunk[c+1 : c+1+estimated_delay]``.
+      - First request (no ``rtc`` block, or no cache) falls through to vanilla
+        flow-matching denoise. The result is cached for the next call.
 
-    Typical usage (action_horizon=16, n_action_steps=8, num_prefix_steps=8):
-      - t=0: No prefix. Full 16-step chunk denoised from scratch. Execute [0:8].
-      - t=1: Previous pred's [8:16] become prefix [0:8]. Only [8:16] denoised
-              freely. Execute new [0:8].
-      - t=2: Same pattern continues.
+    ``prefix_attention_horizon`` is parsed and stored for Phase 2 (soft-mask
+    guidance) but is not used in Phase 1.
+
+    Bounds: if ``current_index + 1 + estimated_delay`` exceeds the cached
+    chunk's action horizon, a ``RuntimeError`` is raised. This is a contract
+    violation between client and server.
     """
 
-    def __init__(
-        self,
-        *args,
-        n_action_steps: int = 8,
-        num_prefix_steps: int = 8,
-        **kwargs,
-    ):
-        """
-        Args:
-            n_action_steps: How many actions to execute before re-planning.
-                The previous prediction is shifted by this amount to build the
-                prefix for the next call.
-            num_prefix_steps: How many leading actions to clamp (inpaint) from
-                the previous prediction.  Must be <= action_horizon.
-            *args, **kwargs: Forwarded to ``Gr00tPolicy.__init__``.
-        """
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.n_action_steps = n_action_steps
-        self.num_prefix_steps = num_prefix_steps
-        # Cached *normalized* action prediction from the previous call.
-        self._prev_normalized_action: Optional[torch.Tensor] = None
+        # Cache of the last normalized chunk returned, shape (1, H, action_dim).
+        self._prev_chunk_normalized: Optional[torch.Tensor] = None
+        # Staged RTC info from the most recent HTTP request. Consumed once per
+        # get_action call and cleared.
+        self._staged_index: Optional[int] = None
+        self._staged_delay: Optional[int] = None
+        self._staged_horizon: Optional[int] = None
+        self._staged_schedule: Optional[str] = None
+        self._staged_max_guidance_weight: Optional[float] = None
+        # Snapshot of staged params for offline analysis. Recorded at stage time
+        # so capture-side code can pair it with the chunk that the request
+        # produces, even though the staged fields are cleared during inference.
+        self._last_rtc_metadata: Optional[Dict[str, Any]] = None
 
-    def reset_action_buffer(self):
-        """Reset the cached action buffer. Call at the start of each episode."""
-        self._prev_normalized_action = None
+    def stage_external_rtc(
+        self,
+        current_index: int,
+        estimated_delay: int,
+        prefix_attention_horizon: Optional[int] = None,
+        prefix_attention_schedule: Optional[str] = None,
+        max_guidance_weight: Optional[float] = None,
+        last_actual_delay_ticks: Optional[int] = None,
+    ) -> None:
+        """Called by the HTTP layer before get_action when the client sends rtc.
+
+        ``last_actual_delay_ticks`` is the wall-clock-measured d_actual of the
+        PREVIOUS HTTP round-trip, as observed by the ROS client. Recorded for
+        offline analysis (capture .npz) — does not affect inference.
+        """
+        self._staged_index = current_index
+        self._staged_delay = estimated_delay
+        self._staged_horizon = prefix_attention_horizon
+        self._staged_schedule = prefix_attention_schedule
+        self._staged_max_guidance_weight = max_guidance_weight
+        # Snapshot for capture. Use -1 sentinel for unset fields so we get
+        # a clean numpy array on flush.
+        self._last_rtc_metadata = {
+            "current_index": current_index,
+            "estimated_delay": estimated_delay,
+            "prefix_attention_horizon": -1 if prefix_attention_horizon is None
+                else int(prefix_attention_horizon),
+            "prefix_attention_schedule": prefix_attention_schedule or "",
+            "max_guidance_weight": -1.0 if max_guidance_weight is None
+                else float(max_guidance_weight),
+            "last_actual_delay_ticks": -1 if last_actual_delay_ticks is None
+                else int(last_actual_delay_ticks),
+        }
+
+    def reset_action_buffer(self) -> None:
+        """Clear the cached chunk. Call between episodes via POST /reset."""
+        self._prev_chunk_normalized = None
+        self._staged_index = None
+        self._staged_delay = None
+        self._staged_horizon = None
+        self._staged_schedule = None
+        self._staged_max_guidance_weight = None
+        self._last_rtc_metadata = None
 
     def _get_action_from_normalized_input(
         self, normalized_input: Dict[str, Any]
     ) -> torch.Tensor:
-        """Override to inject prefix actions into the model call."""
-        prefix_actions = None
+        prefix_actions: Optional[torch.Tensor] = None
         num_prefix = 0
+        K: Optional[int] = None         # prefix_attention_horizon
+        schedule: Optional[str] = None  # decay shape
+        max_w: Optional[float] = None   # guidance weight cap
 
-        if self._prev_normalized_action is not None:
-            # Shift: drop the first n_action_steps (already executed),
-            # the remaining tail becomes our prefix.
-            remaining = self._prev_normalized_action[:, self.n_action_steps:, :]
-            available = remaining.shape[1]
-            num_prefix = min(self.num_prefix_steps, available)
-            if num_prefix > 0:
-                prefix_actions = remaining[:, :num_prefix, :]
+        # Consume any staged RTC info from the HTTP layer.
+        c = self._staged_index
+        d = self._staged_delay
+        K_staged = self._staged_horizon
+        schedule = self._staged_schedule
+        max_w = self._staged_max_guidance_weight
+        self._staged_index = None
+        self._staged_delay = None
+        self._staged_horizon = None
+        self._staged_schedule = None
+        self._staged_max_guidance_weight = None
 
-        with torch.inference_mode(), torch.autocast(
-            device_type="cuda", dtype=COMPUTE_DTYPE
-        ):
-            model_pred = self.model.get_action(
-                normalized_input,
-                prefix_actions=prefix_actions,
-                num_prefix_steps=num_prefix,
-            )
+        if c is not None and d is not None and self._prev_chunk_normalized is not None:
+            H = self._prev_chunk_normalized.shape[1]
+            # The slice we expose to the model spans [c+1, c+1+max(d, K)).
+            # We need at least d positions for hard clamp; if K > d we also
+            # need K positions for the soft region.
+            slice_end_required = c + 1 + max(d, K_staged or 0)
+            if slice_end_required > H:
+                raise RuntimeError(
+                    f"RTC out of bounds: current_action_sequence_index={c}, "
+                    f"estimated_delay_ticks={d}, prefix_attention_horizon={K_staged}, "
+                    f"prior chunk horizon H={H}; "
+                    f"need c+1+max(d, K) <= H but got {slice_end_required} > {H}."
+                )
+            if d > 0 or (K_staged is not None and K_staged > 0):
+                # Expose the longest slice needed for both hard and soft.
+                slice_len = max(d, K_staged or 0)
+                prefix_actions = self._prev_chunk_normalized[:, c + 1 : c + 1 + slice_len, :]
+                num_prefix = d
+                K = K_staged
+
+        # Decide path: Phase 2 guidance if K > d (soft region exists),
+        # otherwise Phase 1 hard-only.
+        use_guidance = (
+            K is not None
+            and num_prefix > 0
+            and K > num_prefix
+            and prefix_actions is not None
+        )
+
+        if use_guidance:
+            # Need autograd for pinv-correction, so use no_grad (not
+            # inference_mode) so we can selectively enable grad inside.
+            with torch.no_grad(), torch.autocast(
+                device_type="cuda", dtype=COMPUTE_DTYPE
+            ):
+                # We need to mirror what self.model.get_action does in the
+                # observation-encoding portion, then dispatch the action head's
+                # guidance variant. The vanilla get_action() goes:
+                #   backbone(...) -> backbone_output ; action_head.get_action(...)
+                # We replicate that here with the guidance head.
+                backbone_inputs, action_inputs = self.model.prepare_input(
+                    normalized_input
+                )
+                backbone_outputs = self.model.backbone(backbone_inputs)
+                model_pred = self.model.action_head.get_action_with_guidance(
+                    backbone_outputs,
+                    action_inputs,
+                    prefix_actions=prefix_actions,
+                    num_prefix_steps=num_prefix,
+                    prefix_attention_horizon=K,
+                    prefix_attention_schedule=schedule or "exp",
+                    max_guidance_weight=max_w if max_w is not None else 5.0,
+                )
+                # Validate same as the vanilla path does (shape only).
+                self.model.validate_data(model_pred, backbone_outputs, is_training=False)
+        else:
+            # Phase 1 hard-clamp-only path.
+            with torch.inference_mode(), torch.autocast(
+                device_type="cuda", dtype=COMPUTE_DTYPE
+            ):
+                # For hard-only, only pass the first `num_prefix` positions.
+                hard_only_prefix = (
+                    prefix_actions[:, :num_prefix, :] if prefix_actions is not None else None
+                )
+                model_pred = self.model.get_action(
+                    normalized_input,
+                    prefix_actions=hard_only_prefix,
+                    num_prefix_steps=num_prefix,
+                )
 
         normalized_action = model_pred["action_pred"].float()
 
-        # Cache the normalized prediction for the next call.
-        self._prev_normalized_action = normalized_action.clone()
+        # Cache for the next request.
+        self._prev_chunk_normalized = normalized_action.clone()
 
         return normalized_action
 

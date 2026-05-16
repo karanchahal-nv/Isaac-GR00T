@@ -148,15 +148,18 @@ class ArgsConfig:
     """Number of action steps to use."""
 
     use_inpainting: bool = False
-    """Whether to use inpainting-based real-time action chunking.
-    When enabled, the policy fixes the first ``num_prefix_steps`` actions from
-    the previous prediction and only denoises the remaining suffix."""
+    """Whether to use the stateful Gr00tInpaintingPolicy for client-driven RTC.
+    When enabled, the policy caches its returned chunks and the client drives
+    the prefix-clamp parameters per-request via the ``rtc`` block in the
+    HTTP body (``current_action_sequence_index``, ``estimated_delay_ticks``).
+    The first request omits ``rtc`` and falls through to vanilla denoise."""
 
-    n_action_execute_steps: int = 8
-    """How many action steps to execute before re-planning (inpainting mode only)."""
+    capture_chunks_path: Optional[str] = None
+    """If set, save the first ``max_captures`` predicted action chunks to this
+    .npz path. Used for offline RTC-vs-no-RTC comparison plots."""
 
-    num_prefix_steps: int = 8
-    """How many leading actions to clamp via inpainting (inpainting mode only)."""
+    max_captures: int = 2
+    """Number of action chunks to capture before writing the .npz."""
 
     alt_checkpoint: Optional[str] = None
     """If set with ``alt_lookup_table``, run ALT encoder + lookup each ``/act`` and add scores."""
@@ -571,7 +574,8 @@ def main(args: ArgsConfig):
         # modality_configs = data_config_cls.modality_config()
 
 
-        video_keys = ["video.camera_1_color_image_raw_compressed", "video.camera_2_color_image_raw_compressed"]
+        # video_keys = ["video.camera_1_color_image_raw_compressed", "video.camera_2_color_image_raw_compressed"]
+        video_keys = ["video.front_stereo_camera_left_image_raw_compressed"]
         video_modality = ModalityConfig(
             delta_indices=[0],
             modality_keys=video_keys,
@@ -658,17 +662,15 @@ def main(args: ArgsConfig):
         )
 
         if args.use_inpainting:
-            print(f"Using INPAINTING policy: "
-                  f"n_action_execute_steps={args.n_action_execute_steps}, "
-                  f"num_prefix_steps={args.num_prefix_steps}")
+            print("Using INPAINTING policy: client-driven RTC (stateful chunk cache)")
             policy = Gr00tInpaintingPolicy(
                 model_path=args.model_path,
                 modality_config=modality_config,
                 modality_transform=modality_transform,
                 embodiment_tag=args.embodiment_tag,
                 denoising_steps=args.denoising_steps,
-                n_action_steps=args.n_action_execute_steps,
-                num_prefix_steps=args.num_prefix_steps,
+                capture_chunks_path=args.capture_chunks_path,
+                max_captures=args.max_captures,
             )
         else:
             policy = Gr00tPolicy(
@@ -677,6 +679,8 @@ def main(args: ArgsConfig):
                 modality_transform=modality_transform,
                 embodiment_tag=args.embodiment_tag,
                 denoising_steps=args.denoising_steps,
+                capture_chunks_path=args.capture_chunks_path,
+                max_captures=args.max_captures,
             )
 
         # Setup TensorRT if requested
@@ -789,6 +793,7 @@ def main(args: ArgsConfig):
         obs = {
             "video.camera_1_color_image_raw_compressed": np.random.randint(0, 256, (1, 480, 640, 3), dtype=np.uint8),
             "video.camera_2_color_image_raw_compressed": np.random.randint(0, 256, (1, 480, 640, 3), dtype=np.uint8),
+            "front_stereo_camera_left_image_raw_compressed": np.random.randint(0, 256, (1, 480, 640, 3), dtype=np.uint8),
             "state.joint_state_position": np.random.rand(1, 6),
             # "state.right_arm": np.random.rand(1, 7),
             # "state.left_hand": np.random.rand(1, 6),

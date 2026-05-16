@@ -39,6 +39,41 @@ def decode_numpy_from_base64(obj):
     return obj
 
 
+def log_video_observation_shape(key: str, value: Any) -> None:
+    """Log video payload shape before GR00T transforms run."""
+    video = np.asarray(value)
+    resolution = tuple(video.shape[-3:-1][::-1]) if video.ndim >= 3 else None
+    print(
+        f"Decoded video observation {key}: "
+        f"shape={video.shape} size={video.size} ndim={video.ndim} "
+        f"dtype={video.dtype} inferred_resolution={resolution}",
+        flush=True,
+    )
+
+
+def flatten_nested_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept C++ InferenceHttpNode's grouped observation payload."""
+    if not any(key in obs for key in ("video", "state", "language")):
+        return obs
+
+    flattened = dict(obs)
+    video_group = flattened.pop("video", {})
+    for key, value in video_group.items():
+        full_key = f"video.{key}"
+        flattened[full_key] = decode_numpy_from_base64(value)
+        log_video_observation_shape(full_key, flattened[full_key])
+
+    state_group = flattened.pop("state", {})
+    for key, value in state_group.items():
+        flattened[f"state.{key}"] = np.asarray(value)
+
+    language_group = flattened.pop("language", {})
+    for key, value in language_group.items():
+        flattened[key] = value
+
+    return flattened
+
+
 class HTTPInferenceServer:
     def __init__(
         self,
@@ -93,12 +128,39 @@ class HTTPInferenceServer:
                     status_code=400, detail="Missing 'observation' field in payload"
                 )
 
-            obs = payload["observation"]
-            
+            obs = flatten_nested_observation(payload["observation"])
+
             for key in list(obs.keys()):
                 if key.startswith("video."):
                     obs[key] = decode_numpy_from_base64(obs[key])
+                    log_video_observation_shape(key, obs[key])
             # print(obs["video.camera"])
+
+            # Stateful client-driven RTC: if the request body has an "rtc"
+            # block AND the policy is an inpainting policy, stage the RTC
+            # info so the policy uses the right prefix this call.
+            rtc = payload.get("rtc")
+            if rtc is not None and isinstance(self.policy, Gr00tInpaintingPolicy):
+                self.policy.stage_external_rtc(
+                    current_index=int(rtc["current_action_sequence_index"]),
+                    estimated_delay=int(rtc["estimated_delay_ticks"]),
+                    prefix_attention_horizon=(
+                        int(rtc["prefix_attention_horizon"])
+                        if "prefix_attention_horizon" in rtc else None
+                    ),
+                    prefix_attention_schedule=(
+                        str(rtc["prefix_attention_schedule"])
+                        if "prefix_attention_schedule" in rtc else None
+                    ),
+                    max_guidance_weight=(
+                        float(rtc["max_guidance_weight"])
+                        if "max_guidance_weight" in rtc else None
+                    ),
+                    last_actual_delay_ticks=(
+                        int(rtc["last_actual_delay_ticks"])
+                        if "last_actual_delay_ticks" in rtc else None
+                    ),
+                )
 
             # Run inference
             action = self.policy.get_action(obs)

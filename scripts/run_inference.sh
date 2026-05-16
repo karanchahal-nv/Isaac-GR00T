@@ -12,14 +12,35 @@ cd "$SCRIPT_DIR/.." || exit 1
 # Uses isaac_manipulator_finetuning on PYTHONPATH (export ISAAC_MANIPULATOR_FINETUNING_ROOT=...).
 # Optional: ALT_DATASET_CAMERA_KEYS (comma-separated) -> --camera-keys k1 k2 ... for build_lookup_table.
 # Optional: ALT_BUILD_DEVICE (e.g. cuda|cpu), ALT_ACTION_CHUNK_SIZE (default 16 in build_lookup_table).
+#
+# Shortcut: source ./set_alt_params.sh then run (same as exporting ALT_* yourself):
+#   ./scripts/run_inference.sh --alt
 REBUILD_ALT_LOOKUP_TABLE=0
+USE_ALT=0
 for _arg in "$@"; do
   case "$_arg" in
     --rebuild-alt-lookup) REBUILD_ALT_LOOKUP_TABLE=1 ;;
+    --alt) USE_ALT=1 ;;
   esac
 done
 if [ "${REBUILD_ALT_LOOKUP:-0}" = 1 ]; then
   REBUILD_ALT_LOOKUP_TABLE=1
+fi
+
+if [ "$USE_ALT" = 1 ]; then
+  _alt_params="$SCRIPT_DIR/../set_alt_params.sh"
+  if [ ! -f "$_alt_params" ]; then
+    echo "Error: --alt expects ${_alt_params}" >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$_alt_params"
+  : "${ALT_CHECKPOINT:?set ALT_CHECKPOINT in set_alt_params.sh}"
+  : "${ALT_LOOKUP_TABLE:?set ALT_LOOKUP_TABLE in set_alt_params.sh}"
+  : "${ALT_DATASET_PATH:?set ALT_DATASET_PATH in set_alt_params.sh}"
+  : "${VIZ_PORT:?set VIZ_PORT in set_alt_params.sh}"
+  : "${ALT_DATASET_CAMERA_KEYS:?set ALT_DATASET_CAMERA_KEYS in set_alt_params.sh}"
+  : "${ISAAC_MANIPULATOR_FINETUNING_ROOT:?set ISAAC_MANIPULATOR_FINETUNING_ROOT in set_alt_params.sh}"
 fi
 
 # Prefer conda env ``gr00t`` (torch, pyarrow, GR00T deps). Override: ``PYTHON=/path/to/python bash ...``
@@ -33,10 +54,7 @@ if [ -z "${PYTHON:-}" ]; then
   PYTHON="${PYTHON:-python3}"
 fi
 
-if [ -z "$GROOT_CHECKPOINT_PATH" ]; then
-    echo "Error: GROOT_CHECKPOINT_PATH environment variable is not set" >&2
-    exit 1
-fi
+: "${GROOT_CHECKPOINT_PATH:?set GROOT_CHECKPOINT_PATH (GR00T checkpoint dir) before running}"
 
 # Optional ALT OOD score on each HTTP /act response (ood_score = NN cosine, higher => more in-distribution).
 # Requires isaac_manipulator_finetuning on PYTHONPATH or pass --alt-finetuning-root via ALT_ARGS below.
@@ -107,4 +125,9 @@ if [ "$REBUILD_ALT_LOOKUP_TABLE" = 1 ]; then
     "${_build_cmd[@]}"
 fi
 
-python scripts/inference_service.py --server --http-server --host 10.111.83.67 --port 8000 --model-path "$GROOT_CHECKPOINT_PATH" --num-action-steps 32 "${ALT_ARGS[@]}"
+# Action-chunk capture for offline RTC-vs-no-RTC plot comparison.
+# Override via env: CAPTURE_CHUNKS_PATH=/some/path.npz MAX_CAPTURES=N bash ...
+CAPTURE_CHUNKS_PATH="${CAPTURE_CHUNKS_PATH:-/tmp/chunks_no_rtc.npz}"
+MAX_CAPTURES="${MAX_CAPTURES:-2}"
+
+python scripts/inference_service.py --server --http-server --host 10.111.83.67 --port 8000 --model-path "${GROOT_CHECKPOINT_PATH}" --num-action-steps 32 --capture-chunks-path "$CAPTURE_CHUNKS_PATH" --max-captures "$MAX_CAPTURES" "${ALT_ARGS[@]}"
